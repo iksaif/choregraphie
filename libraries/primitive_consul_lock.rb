@@ -19,6 +19,7 @@ module Choregraphie
       end
 
       @options[:backoff] ||= 5 # seconds
+      @options[:global] ||= false
 
       if @options[:consul_token]
         require 'diplomat'
@@ -55,14 +56,25 @@ module Choregraphie
       Semaphore
     end
 
-    def semaphore
-      # this object cannot be reused after enter/exit
-      semaphore_class.get_or_create(path, concurrency, dc: @options[:datacenter])
+    def semaphores
+      if @options[:global]
+        GlobalSemaphore.get_or_create(semaphore_class, path, concurrency)
+      else
+        semaphore_class.get_or_create(path, concurrency, dc: datacenters)
+      end
     end
 
     def backoff
-      Chef::Log.warn "Will sleep #{@options[:backoff]}"
-      sleep @options[:backoff]
+      duration = @options[:backoff]
+      if @options[:global]
+        # If we take a global lock we need to try to avoid
+        # everybody trying to take the lock at the same time, for that
+        # we just randomize the time to take the lock (and increase it
+        # slightly).
+        duration += Random.rand(duration)
+      end
+      Chef::Log.warn "Will sleep #{duration}"
+      sleep duration
       false # indicates failure
     end
 
@@ -89,7 +101,9 @@ module Choregraphie
     def register(choregraphie)
 
       choregraphie.before do
-        wait_until(:enter) { semaphore.enter(name: @options[:id]) }
+        wait_until(:enter) {
+          semaphore.enter(name: @options[:id])
+        }
       end
 
       choregraphie.finish do
@@ -99,7 +113,9 @@ module Choregraphie
         # The reason we have to be a bit more relaxed here, is that all
         # chef run including a choregraphie with this primitive try to
         # release the lock at the end of a successful run
-        wait_until(:exit, max_failures: 5) { semaphore.exit(name: @options[:id]) }
+        wait_until(:exit, max_failures: 5) {
+          semaphore.exit(name: @options[:id])
+        }
       end
     end
 
@@ -208,5 +224,41 @@ module Choregraphie
     def holders
       @h['holders']
     end
+  end
+
+  class GlobalSemaphore
+
+    def self.get_or_create(semaphore_class, path, concurrency)
+      require 'diplomat'
+      datacenters = Diplomat::Datecenter.get().sort
+
+      semaphores = []
+      datacenters.each do |dc|
+        semaphores << semaphore_class.get_or_create(path, concurrency, dc: dc)
+      end
+      new(path, semaphores)
+    end
+
+    def initialize(path, semaphores)
+      @path       = path
+      @semaphores = []
+    end
+
+    def enter(opts)
+      results = []
+      semaphores.each do |semaphore|
+        results << semaphore.enter(name: @options[:id])
+      end
+      # TODO: count results
+      # - if we have a majority, return true
+      # - if we don't have a majority, return false and release the semaphores
+    end
+
+    def exit(opts)
+      semaphores.each do |semaphore|
+        semaphore.exit(name: @options[:id])
+      end
+    end
+
   end
 end
